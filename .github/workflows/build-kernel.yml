@@ -1,0 +1,120 @@
+name: Build RK3399 6.1 Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      localversion:
+        description: "Kernel local version"
+        required: false
+        default: "-sh21r"
+  push:
+    branches:
+      - main
+    paths:
+      - "arch/arm64/boot/dts/rockchip/rk3399-sh21r.dts"
+      - ".github/workflows/build-kernel.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    env:
+      KERNEL_BRANCH: main
+      LOCALVERSION: ${{ github.event.inputs.localversion || '-sh21r' }}
+      KBUILD_BUILD_USER: github
+      KBUILD_BUILD_HOST: ci
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KERNEL_BRANCH }}
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libssl-dev make gcc \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            kmod cpio gzip bzip2 xz-utils zstd dpkg
+
+      - name: Prepare config
+        run: |
+          if [ -f config-6.1 ]; then
+            cp config-6.1 .config
+          else
+            make ARCH=arm64 defconfig
+          fi
+
+          # 保证 RK3399 / sh21r 相关配置打开
+          ./scripts/config \
+            --enable CONFIG_ARCH_ROCKCHIP \
+            --enable CONFIG_DTC \
+            --enable CONFIG_MODULES \
+            --enable CONFIG_USB \
+            --enable CONFIG_NET
+
+          make ARCH=arm64 olddefconfig
+
+      - name: Build kernel + dtbs + modules
+        run: |
+          export LOCALVERSION=$LOCALVERSION
+          make -j$(nproc) \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image dtbs modules
+
+      - name: Install modules to package dir
+        run: |
+          mkdir -p out/linux-6.1-rk3399-sh21r
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH=out/linux-6.1-rk3399-sh21r modules_install
+
+          cp arch/arm64/boot/Image out/linux-6.1-rk3399-sh21r/Image
+          mkdir -p out/linux-6.1-rk3399-sh21r/dtbs
+          cp arch/arm64/boot/dts/rockchip/rk3399-sh21r.dtb out/linux-6.1-rk3399-sh21r/dtbs/ || true
+          cp arch/arm64/boot/dts/rockchip/*.dtb out/linux-6.1-rk3399-sh21r/dtbs/ 2>/dev/null || true
+
+          # 去掉模块目录里的软链接版本号目录，方便使用
+          rm -f out/linux-6.1-rk3399-sh21r/lib/modules/*/build
+          rm -f out/linux-6.1-rk3399-sh21r/lib/modules/*/source
+
+      - name: Show kernel version
+        id: kv
+        run: |
+          VERSION=$(make -s ARCH=arm64 kernelrelease)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Kernel: $VERSION"
+
+      - name: Package artifacts
+        run: |
+          cd out
+          tar -czf ../rk3399-sh21r-kernel-${{ steps.kv.outputs.version }}.tar.gz \
+            linux-6.1-rk3399-sh21r
+          cd ..
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rk3399-sh21r-kernel-${{ steps.kv.outputs.version }}
+          path: rk3399-sh21r-kernel-*.tar.gz
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kernel-${{ steps.kv.outputs.version }}
+          name: Linux ${{ steps.kv.outputs.version }} (RK3399 sh21r)
+          body: |
+            Auto build from branch `main`
+
+            - Image
+            - rk3399-sh21r.dtb
+            - kernel modules
+          files: |
+            rk3399-sh21r-kernel-*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
